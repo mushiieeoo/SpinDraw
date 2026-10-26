@@ -84,6 +84,17 @@ func clear() -> void:
 	queue_redraw()
 
 
+## Replace the drawing with these cells (used when you tap a filled slot to edit it).
+func load_cells(cells: Array[Vector2i]) -> void:
+	_strokes.clear()
+	_current.clear()
+	_drawing = false
+	if not cells.is_empty():
+		_strokes.append(cells.duplicate())
+	strokes_changed.emit()
+	queue_redraw()
+
+
 ## All painted cells (no duplicates), including the stroke being drawn right now.
 func get_cells() -> Array[Vector2i]:
 	var seen := {}

@@ -1,28 +1,41 @@
 extends Node
-## Phase 1 screen, built entirely in code:
-##   layer 0  world   (background, drawing box, stage, tops)
-##   layer 1  pixel   (full-screen pixelate shader over the world)
-##   layer 2  ui      (title, buttons, stats) -> stays crisp, above the shader
+## SpinDraw, built entirely in code. Two screens:
+##   DRAW   - draw a top, pick an archetype, lock it into slot P1 / P2
+##   BATTLE - the hexagon arena, tops move with their MovementAI
+## Canvas layers:
+##   0 world (background, drawing box, arena)  ->  1 pixelate shader  ->  2 UI (stays crisp)
+
+enum Mode { DRAW, BATTLE }
 
 const FONT_PATH := "res://assets/fonts/PressStart2P-Regular.ttf"
 const PIXEL_SIZE := 4.0
-const HINT := "R: CLEAR STAGE   P: PIXEL FX"
-const TOP_COLORS := [Pal.RED, Pal.BLUE, Pal.GREEN, Pal.ORANGE, Pal.PINK, Pal.LAVENDER]
+const SCREEN_CENTER := Vector2(640, 360)
+const START_POS := [Vector2(-250, 40), Vector2(250, -40)]   # arena-local
 
 var _font: Font
+var _mode := Mode.DRAW
 var _canvas: DrawCanvas
-var _stage: Stage
+var _arena: Arena
 var _pixel_rect: ColorRect
+var _draw_ui: Control
+var _battle_ui: Control
 var _msg: Label
 var _msg_id := 0
 var _area_label: Label
 var _bars := {}    # stat name -> StatBar
 var _vals := {}    # stat name -> Label
+var _slots: Array[SlotCard] = []
+var _designs: Array[TopDesign] = []
+var _arch_buttons: Array[Button] = []
+var _p_labels: Array[Label] = []
+var _fighters: Array[TopDesign] = []
 var _tops: Array[Top] = []
-var _color_i := 0
+var _slot := 0
+var _arch := 0
 
 
 func _ready() -> void:
+	_designs.resize(2)
 	_font = _load_font()
 	_build_world()
 	_build_pixel_layer()
@@ -30,10 +43,13 @@ func _ready() -> void:
 	_canvas.strokes_changed.connect(_refresh_stats)
 	get_window().size_changed.connect(_update_pixel_size)
 	_update_pixel_size()
+	_set_mode(Mode.DRAW)
+	_select_slot(0)
+	_set_arch(0)
 	_refresh_stats()
 
 
-# ---------------------------------------------------------------- building
+# ================================================================ building
 
 func _load_font() -> Font:
 	if ResourceLoader.exists(FONT_PATH):
@@ -60,9 +76,9 @@ func _build_world() -> void:
 	_canvas.font = _font
 	world.add_child(_canvas)
 
-	_stage = Stage.new()
-	_stage.position = Vector2(680, 60)
-	world.add_child(_stage)
+	_arena = Arena.new()
+	_arena.position = SCREEN_CENTER
+	world.add_child(_arena)
 
 
 func _build_pixel_layer() -> void:
@@ -82,30 +98,64 @@ func _build_ui() -> void:
 	var layer := CanvasLayer.new()
 	layer.layer = 2
 	add_child(layer)
-	var ui := Control.new()
-	ui.size = Vector2(1280, 720)
-	ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	layer.add_child(ui)
+	_draw_ui = _screen_root(layer)
+	_battle_ui = _screen_root(layer)
+	_build_draw_ui()
+	_build_battle_ui()
 
-	ui.add_child(_label("TOP CLASH", 32, Pal.YELLOW, Vector2(20, 12), true))
-	ui.add_child(_label("DRAW YOUR SPINNING TOP!", 16, Pal.PEACH, Vector2(340, 24), true))
 
-	_msg = _label(HINT, 16, Pal.LIGHT_GRAY, Vector2(680, 410), false)
+func _screen_root(parent: Node) -> Control:
+	var c := Control.new()
+	c.size = Vector2(1280, 720)
+	c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	parent.add_child(c)
+	return c
+
+
+func _build_draw_ui() -> void:
+	var ui := _draw_ui
+	ui.add_child(_label("SPINDRAW", 32, Pal.YELLOW, Vector2(20, 12), true))
+	ui.add_child(_label("DRAW YOUR SPINNING TOP!", 16, Pal.PEACH, Vector2(310, 24), true))
+
+	# Slot cards (P1 / P2)
+	for i in 2:
+		var card := SlotCard.new()
+		card.index = i
+		card.font = _font
+		card.position = Vector2(680 + i * 300, 60)
+		card.size = Vector2(280, 148)
+		card.picked.connect(_select_slot)
+		ui.add_child(card)
+		_slots.append(card)
+
+	# Archetype toggle buttons
+	var group := ButtonGroup.new()
+	for i in 3:
+		var b := _button(GameConst.ARCH_NAMES[i], GameConst.ARCH_COLORS[i], Pal.BLACK,
+			Vector2(680 + i * 200, 224), Vector2(180, 48), 16, true)
+		b.button_group = group
+		b.pressed.connect(_set_arch.bind(i))
+		ui.add_child(b)
+		_arch_buttons.append(b)
+
+	# Message / hint line
+	_msg = _label("", 16, Pal.LIGHT_GRAY, Vector2(680, 284), false)
 	ui.add_child(_msg)
 
-	var spawn := _button("SPAWN", Pal.GREEN, Pal.BLACK, Vector2(680, 436))
-	spawn.pressed.connect(_on_spawn)
-	ui.add_child(spawn)
-	var undo := _button("UNDO", Pal.ORANGE, Pal.BLACK, Vector2(880, 436))
+	# Action buttons
+	var lock := _button("LOCK IN", Pal.GREEN, Pal.BLACK, Vector2(680, 316))
+	lock.pressed.connect(_on_lock_in)
+	ui.add_child(lock)
+	var undo := _button("UNDO", Pal.ORANGE, Pal.BLACK, Vector2(880, 316))
 	undo.pressed.connect(func(): _canvas.undo())
 	ui.add_child(undo)
-	var clear := _button("CLEAR", Pal.RED, Pal.WHITE, Vector2(1080, 436))
+	var clear := _button("CLEAR", Pal.RED, Pal.WHITE, Vector2(1080, 316))
 	clear.pressed.connect(func(): _canvas.clear())
 	ui.add_child(clear)
 
 	# Stats panel
 	var panel := Panel.new()
-	panel.position = Vector2(680, 508)
+	panel.position = Vector2(680, 392)
 	panel.size = Vector2(580, 192)
 	panel.add_theme_stylebox_override("panel", _box(Pal.DARK_BLUE, Pal.LAVENDER, 4, 4))
 	ui.add_child(panel)
@@ -131,6 +181,30 @@ func _build_ui() -> void:
 		var val := _label("-", 16, Pal.WHITE, Vector2(440, y + 2), false)
 		panel.add_child(val)
 		_vals[key] = val
+
+	# FIGHT!
+	var fight := _button("FIGHT!", Pal.PINK, Pal.BLACK, Vector2(680, 612), Vector2(580, 88), 32)
+	fight.pressed.connect(_start_battle)
+	ui.add_child(fight)
+
+
+func _build_battle_ui() -> void:
+	var ui := _battle_ui
+	var back := _button("BACK", Pal.ORANGE, Pal.BLACK, Vector2(20, 20), Vector2(160, 56))
+	back.pressed.connect(_leave_battle)
+	ui.add_child(back)
+	var again := _button("REMATCH", Pal.GREEN, Pal.BLACK, Vector2(20, 96), Vector2(160, 56))
+	again.pressed.connect(_spawn_fighters)
+	ui.add_child(again)
+
+	var l1 := _label("", 16, Pal.WHITE, Vector2(20, 180), true)
+	l1.size = Vector2(200, 100)
+	ui.add_child(l1)
+	var l2 := _label("", 16, Pal.WHITE, Vector2(1060, 180), true)
+	l2.size = Vector2(200, 100)
+	l2.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	ui.add_child(l2)
+	_p_labels = [l1, l2]
 
 
 func _label(text: String, font_size: int, color: Color, pos: Vector2, shadow: bool) -> Label:
@@ -159,26 +233,29 @@ func _box(fill: Color, border: Color, width: int, bottom: int) -> StyleBoxFlat:
 	return sb
 
 
-func _button(text: String, color: Color, text_color: Color, pos: Vector2) -> Button:
+func _button(text: String, color: Color, text_color: Color, pos: Vector2,
+		sz := Vector2(180, 56), font_size := 16, toggle := false) -> Button:
 	var b := Button.new()
 	b.text = text
 	b.position = pos
-	b.size = Vector2(180, 56)
+	b.size = sz
+	b.toggle_mode = toggle
 	b.focus_mode = Control.FOCUS_NONE
 	b.add_theme_font_override("font", _font)
-	b.add_theme_font_size_override("font_size", 16)
-	for c in ["font_color", "font_hover_color", "font_pressed_color"]:
+	b.add_theme_font_size_override("font_size", font_size)
+	for c in ["font_color", "font_hover_color", "font_pressed_color", "font_hover_pressed_color"]:
 		b.add_theme_color_override(c, text_color)
 	b.add_theme_stylebox_override("normal", _box(color, Pal.BLACK, 4, 10))
 	b.add_theme_stylebox_override("hover", _box(color.lerp(Pal.WHITE, 0.3), Pal.BLACK, 4, 10))
-	var pressed := _box(color.darkened(0.2), Pal.BLACK, 4, 4)
+	var pressed := _box(color.darkened(0.25), Pal.BLACK, 4, 4)
 	pressed.content_margin_top = 6
 	b.add_theme_stylebox_override("pressed", pressed)
+	b.add_theme_stylebox_override("hover_pressed", pressed)
 	b.add_theme_stylebox_override("focus", StyleBoxEmpty.new())
 	return b
 
 
-# ---------------------------------------------------------------- pixel fx
+# ================================================================ pixel fx + keys
 
 func _update_pixel_size() -> void:
 	# Keep the pixels the same size relative to the game when the window is resized.
@@ -194,74 +271,117 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		return
 	match k.keycode:
 		KEY_R:
-			_clear_stage()
+			if _mode == Mode.BATTLE:
+				_spawn_fighters()
+		KEY_ESCAPE:
+			if _mode == Mode.BATTLE:
+				_leave_battle()
 		KEY_P:
 			_pixel_rect.visible = not _pixel_rect.visible
 
 
-# ---------------------------------------------------------------- gameplay
+# ================================================================ screens
 
-func _analyze(cells: Array[Vector2i]) -> Dictionary:
-	var hull := ShapeUtils.convex_hull(ShapeUtils.cells_to_points(cells, GameConst.GRID))
-	if hull.size() < 3:
-		return {}
-	var ac := ShapeUtils.area_and_centroid(hull)
-	ac["hull"] = hull
-	return ac
+func _set_mode(m: Mode) -> void:
+	_mode = m
+	var battle := m == Mode.BATTLE
+	_canvas.visible = not battle
+	_draw_ui.visible = not battle
+	_arena.visible = battle
+	_battle_ui.visible = battle
 
 
-func _on_spawn() -> void:
-	var cells := _canvas.get_cells()
-	if cells.is_empty():
-		_say("DRAW SOMETHING FIRST!", Pal.ORANGE)
+func _start_battle() -> void:
+	if _designs[0] == null and _designs[1] == null:
+		_say("LOCK IN A TOP FIRST!", Pal.ORANGE)
 		return
-	var data := _analyze(cells)
-	if data.is_empty() or float(data["area"]) < GameConst.MIN_AREA:
-		_say("TOO SMALL! DRAW MORE", Pal.ORANGE)
-		return
-
-	var area: float = data["area"]
-	var centroid: Vector2 = data["centroid"]
-	var hull: PackedVector2Array = data["hull"]
-	var stats := TopStats.from_area(area)
-
-	while _tops.size() >= GameConst.MAX_TOPS:
-		var old: Top = _tops.pop_front()
-		if is_instance_valid(old):
-			old.queue_free()
-
-	var top := Top.new()
-	top.position = _stage.size / 2.0 + Vector2(randf_range(-80, 80), randf_range(-60, 60))
-	var color: Color = TOP_COLORS[_color_i % TOP_COLORS.size()]
-	_color_i += 1
-	top.setup(cells, hull, centroid, stats, color)
-	_stage.add_child(top)
-	top.linear_velocity = Vector2.from_angle(randf() * TAU) * stats.speed * 0.6
-	_tops.append(top)
-	_say("SPAWNED!", Pal.GREEN)
+	_fighters.clear()
+	for i in 2:
+		var d: TopDesign = _designs[i]
+		if d == null:
+			# empty slot -> random CPU opponent
+			d = TopDesign.random_cpu(randi() % 3, GameConst.SLOT_COLORS[i])
+		_fighters.append(d)
+	_set_mode(Mode.BATTLE)
+	_spawn_fighters()
 
 
-func _clear_stage() -> void:
+func _leave_battle() -> void:
+	_clear_tops()
+	_set_mode(Mode.DRAW)
+
+
+func _clear_tops() -> void:
 	for t in _tops:
 		if is_instance_valid(t):
 			t.queue_free()
 	_tops.clear()
 
 
-func _refresh_stats() -> void:
+func _spawn_fighters() -> void:
+	_clear_tops()
+	for i in 2:
+		var d := _fighters[i]
+		var top := Top.new()
+		top.position = START_POS[i]
+		top.setup(d)
+		_arena.add_child(top)
+		top.ai.center = _arena.global_position
+		_tops.append(top)
+		_p_labels[i].text = "P%d%s\n%s\nHP %d" % [i + 1, " CPU" if d.is_cpu else "",
+			GameConst.ARCH_NAMES[d.archetype], int(d.stats.hp)]
+		_p_labels[i].add_theme_color_override("font_color", d.color)
+	_tops[0].ai.target = _tops[1]
+	_tops[1].ai.target = _tops[0]
+
+
+# ================================================================ drawing screen logic
+
+func _select_slot(i: int) -> void:
+	_slot = i
+	for s in _slots:
+		s.selected = (s.index == i)
+	var d: TopDesign = _designs[i]
+	if d != null:
+		_canvas.load_cells(d.cells)
+		_set_arch(d.archetype)
+
+
+func _set_arch(a: int) -> void:
+	_arch = a
+	_arch_buttons[a].button_pressed = true
+	_show_hint()
+
+
+func _on_lock_in() -> void:
 	var cells := _canvas.get_cells()
-	var data: Dictionary = {}
-	if not cells.is_empty():
-		data = _analyze(cells)
-	if data.is_empty():
+	if cells.is_empty():
+		_say("DRAW SOMETHING FIRST!", Pal.ORANGE)
+		return
+	var col: Color = GameConst.SLOT_COLORS[_slot]
+	var d := TopDesign.from_cells(cells, _arch, col)
+	if d == null:
+		_say("TOO SMALL! DRAW MORE", Pal.ORANGE)
+		return
+	_designs[_slot] = d
+	_slots[_slot].design = d
+	_canvas.clear()
+	_say("P%d LOCKED IN!" % (_slot + 1), Pal.GREEN)
+	var other := 1 - _slot
+	if _designs[other] == null:
+		_select_slot(other)
+
+
+func _refresh_stats() -> void:
+	var d := TopDesign.from_cells(_canvas.get_cells(), _arch, Pal.WHITE)
+	if d == null:
 		_area_label.text = "AREA -"
 		for key in _bars:
 			_bars[key].value = 0.0
 			_vals[key].text = "-"
 		return
-	var area: float = data["area"]
-	var s := TopStats.from_area(area)
-	_area_label.text = "AREA %d" % int(area)
+	var s := d.stats
+	_area_label.text = "AREA %d" % int(s.area)
 	_set_stat("HP", s.size_t, "%d" % int(s.hp))
 	_set_stat("MASS", s.size_t, "%.1f" % s.mass)
 	_set_stat("SPEED", 1.0 - s.size_t, "%d" % int(s.speed))
@@ -273,6 +393,11 @@ func _set_stat(key: String, norm: float, text: String) -> void:
 	_vals[key].text = text
 
 
+func _show_hint() -> void:
+	_msg.text = GameConst.ARCH_DESC[_arch]
+	_msg.add_theme_color_override("font_color", Pal.LIGHT_GRAY)
+
+
 func _say(text: String, color: Color = Pal.PEACH) -> void:
 	_msg_id += 1
 	var id := _msg_id
@@ -280,5 +405,4 @@ func _say(text: String, color: Color = Pal.PEACH) -> void:
 	_msg.add_theme_color_override("font_color", color)
 	await get_tree().create_timer(2.0).timeout
 	if id == _msg_id:
-		_msg.text = HINT
-		_msg.add_theme_color_override("font_color", Pal.LIGHT_GRAY)
+		_show_hint()
