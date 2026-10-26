@@ -1,0 +1,14 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+*.translation
+
+# Exports
+export_presets.cfg
+*.exe
+*.pck
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
